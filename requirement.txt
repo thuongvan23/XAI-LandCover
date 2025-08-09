@@ -1,0 +1,8 @@
+py -m pip instal streamlit
+py -m pip install torch torchvision torchaudio
+py -m pip install matplotlib
+py -m pip install efficientnet_pytorch
+py -m pip install rasterio
+py -m pip install scikit-learn
+py -m pip install timm==1.0.17 --upgrade
+py -m pip install albumentations
