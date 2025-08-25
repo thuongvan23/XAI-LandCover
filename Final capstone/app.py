@@ -8,6 +8,8 @@ import albumentations as A
 
 from lime_utils import lime_multi_band_importance 
 from shap_utils import shap_multi_band_importance_efficientnet
+from kshap_utils import kshap_multi_band_importance_vit
+from xai_utils import combine_xai_results
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 from pytorch_grad_cam.utils.image import show_cam_on_image
@@ -61,7 +63,7 @@ def preprocess_image(uploaded_file, file_type, model_type):
       tensor_img: torch.FloatTensor shape (1, C, H, W) trên DEVICE
       np_img_for_display: numpy array dùng để hiển thị RGB (C,H,W hoặc H,W,C)
     """
-    # đọc input
+    # Load input
     if file_type == 'npy':
         np_img = np.load(uploaded_file)  # (C, H, W)
     elif file_type == 'tif':
@@ -73,10 +75,10 @@ def preprocess_image(uploaded_file, file_type, model_type):
     if np_img.shape[0] != 12:
         raise ValueError("Ảnh phải có đúng 12 bands (12, H, W).")
 
-    # normalize giống lúc train
+    # Normalize
     np_img = np_img.astype(np.float32) / 10000.0
 
-    # nếu model_type == "ViT": resize to 224x224 (H,W)
+    # If model_type == "ViT": resize to 224x224 (H,W)
     if model_type == "ViT":
         # albumentations expects HWC
         hwc = np.transpose(np_img, (1, 2, 0))  # (H, W, C)
@@ -91,11 +93,6 @@ def preprocess_image(uploaded_file, file_type, model_type):
     return tensor_img, np_img  # return original np_img for display (bands, H, W)
 
 def safe_predict(model, image_tensor, apply_sigmoid: bool):
-    """
-    Thực hiện forward và trả về probs numpy.
-    apply_sigmoid=True => dùng sigmoid(output)
-    apply_sigmoid=False => trả trực tiếp output (assume model already outputs probabilities/logits as desired)
-    """
     model.eval()
     with torch.no_grad():
         out = model(image_tensor.to(DEVICE))
@@ -177,7 +174,7 @@ try:
         rgb = np_img_orig[[3, 2, 1], :, :]
         rgb = np.transpose(rgb, (1, 2, 0))
         rgb_vis = (rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-8)
-        st.image(rgb_vis, caption="RGB emulation (band 4-3-2)", use_column_width=True)
+        st.image(rgb_vis, caption="RGB emulation (band 4-3-2)",  width=500)
     except Exception:
         st.write("Unable to display RGB preview")
 
@@ -188,7 +185,7 @@ try:
     probs = np.array(probs).reshape(-1)
 
     # Display predictions
-    st.subheader("🧠 Probabilities")
+    st.subheader("Probabilities")
     threshold = st.sidebar.slider("Threshold", 0.1, 0.9, 0.5, 0.05)
     cols = st.columns(2)
     with cols[0]:
@@ -196,88 +193,93 @@ try:
             mark = "✅" if p > threshold else ""
             st.write(f"{i:02d} {class_names[i]}: {p:.3f} {mark}")
 
-    # LIME band importance
+    # # XAI: LIME / Kernel SHAP band importance
     positive_indices = [i for i, p in enumerate(probs) if p > threshold]
-    st.subheader("📊 LIME-style: band importance")
+    # -----------------------------
+    st.subheader("📊 XAI Band Importance (Combined)")
 
     if len(positive_indices) == 0:
         st.info("No class exceeds the threshold for calculating XAI.")
     else:
-        chosen_for_lime = st.selectbox(
-            "Select class to calculate LIME (band importance)",
+        chosen_for_xai = st.selectbox(
+            "Select class to calculate band-importance",
             positive_indices,
             format_func=lambda x: f"{x} - {class_names[x]} ({probs[x]:.3f})"
         )
-        num_samples = st.sidebar.number_input("LIME num_samples", min_value=100, max_value=5000, value=1000, step=100)
 
-        if st.button("Calculate LIME for class " + str(chosen_for_lime)):
-            with st.spinner("Calculating LIME..."):
-                importances = lime_multi_band_importance(
-                    model=model,
-                    image_tensor=image_tensor.squeeze(0),
-                    target_class=chosen_for_lime,
-                    num_samples=int(num_samples),
-                    method='zero',
-                    apply_sigmoid=apply_sigmoid
-                )
-                st.session_state['lime_result'] = {
-                    'class_id': chosen_for_lime,
-                    'importances': importances
-                }
-
-        # Nếu đã có kết quả trong session_state thì hiển thị lại
-        if 'lime_result' in st.session_state:
-            lime_res = st.session_state['lime_result']
-            fig, ax = plt.subplots(figsize=(8, 3))
-            ax.bar(np.arange(1, len(lime_res['importances']) + 1), lime_res['importances'])
-            ax.set_xlabel("Band")
-            ax.set_ylabel("Importance")
-            ax.set_title(f"LIME band importance for class {lime_res['class_id']} - {class_names[lime_res['class_id']]}")
-            st.pyplot(fig)
-
-
-    # SHAP block
-    st.subheader("📈 SHAP Band Importance")
-    if len(positive_indices) == 0:
-        st.info("No class exceeds the threshold for calculating XAI.")
-    else:
-        chosen_for_shap = st.selectbox(
-            "Select class to calculate SHAP",
-            positive_indices,
-            format_func=lambda x: f"{x} - {class_names[x]} ({probs[x]:.3f})",
-            key="shap_class"
-        )
-        background_path = st.sidebar.text_input(
-            "Path to backgrounds_dict.pt",
-            value="backgrounds_dict_eff_shap.pt"
-        )
-
-        if st.button("Calculate SHAP for class " + str(chosen_for_shap)):
+        if st.button("Calculate XAI for class " + str(chosen_for_xai)):
             try:
-                with st.spinner("Calculating SHAP..."):
-                    shap_importances = shap_multi_band_importance_efficientnet(
-                        model=model,
-                        image_tensor=image_tensor,
-                        target_class=chosen_for_shap,
-                        background_dict_path=background_path,
-                        apply_sigmoid=apply_sigmoid,
-                        device=DEVICE
-                    )
-                    st.session_state['shap_result'] = {
-                        'class_id': chosen_for_shap,
-                        'importances': shap_importances
-                    }
-            except Exception as e:
-                st.error(f"Error in calculating SHARP: {e}")
+                with st.spinner("Calculating XAI..."):
+                    if model_choice == "EfficientNet":
+                        # ---------------- LIME ----------------
+                        lime_vals = lime_multi_band_importance(
+                            model=model,
+                            image_tensor=image_tensor.squeeze(0),
+                            target_class=chosen_for_xai,
+                            num_samples=1000,
+                            method='zero',
+                            apply_sigmoid=apply_sigmoid
+                        )
 
-        # hiển thị lại nếu đã có kết quả SHAP
-        if 'shap_result' in st.session_state:
-            shap_res = st.session_state['shap_result']
+                        # ---------------- SHAP ----------------
+                        shap_vals = shap_multi_band_importance_efficientnet(
+                            model=model,
+                            image_tensor=image_tensor,
+                            target_class=chosen_for_xai,
+                            background_dict_path= "backgrounds_dict_eff_shap.pt",
+                            apply_sigmoid=apply_sigmoid,
+                            device=DEVICE,
+                            model_type=model_choice,
+                            max_samples= 50
+                        )
+
+                        combined_vals = combine_xai_results(lime_vals, shap_vals)
+                        method_label = "LIME + SHAP (avg)"
+
+                    else:  # ViT
+                        # ---------------- Kernel SHAP ----------------
+                        kshap_vals = kshap_multi_band_importance_vit(
+                            model=model,
+                            image_tensor=image_tensor,
+                            target_class=chosen_for_xai,
+                            nsamples= 150,
+                            apply_sigmoid=apply_sigmoid,
+                            background_dict_path= "backgrounds_dict_vit_shap.pt",
+                            device=DEVICE
+                        )
+
+                        # ---------------- SHAP ----------------
+                        shap_vals = shap_multi_band_importance_efficientnet(
+                            model=model,
+                            image_tensor=image_tensor,
+                            target_class=chosen_for_xai,
+                            background_dict_path = "backgrounds_dict_vit_shap.pt",
+                            apply_sigmoid=apply_sigmoid,
+                            device=DEVICE,
+                            model_type=model_choice,
+                            max_samples= 20
+                        )
+
+                        combined_vals = combine_xai_results(kshap_vals, shap_vals)
+                        method_label = "Kernel SHAP + SHAP (avg)"
+
+                    st.session_state['xai_result'] = {
+                        'class_id': chosen_for_xai,
+                        'importances': combined_vals,
+                        'method': method_label
+                    }
+
+            except Exception as e:
+                st.error(f"Error in calculating XAI: {e}")
+
+        # Show XAI result
+        if 'xai_result' in st.session_state:
+            xai_res = st.session_state['xai_result']
             fig, ax = plt.subplots(figsize=(8, 3))
-            ax.bar(np.arange(1, len(shap_res['importances']) + 1), shap_res['importances'])
+            ax.bar(np.arange(1, len(xai_res['importances']) + 1), xai_res['importances'])
             ax.set_xlabel("Band")
-            ax.set_ylabel("Total SHAP value")
-            ax.set_title(f"SHAP band importance for class {shap_res['class_id']} - {class_names[shap_res['class_id']]}")
+            ax.set_ylabel("Importance (avg normalized)")
+            ax.set_title(f"{xai_res['method']} for class {xai_res['class_id']} - {class_names[xai_res['class_id']]}")
             st.pyplot(fig)
 
     # Grad-CAM block
@@ -308,14 +310,48 @@ try:
                         'image': vis
                     }
 
-        # hiển thị lại nếu đã có Grad-CAM
+        # Re-display if Grad-CAM is present
         if 'gradcam_result' in st.session_state:
             g = st.session_state['gradcam_result']
-            st.image(
-                g['image'],
-                caption=f"Grad-CAM class {g['class_id']} ({class_names[g['class_id']]}), band {g['band_id']}",
-                use_column_width=True
-            )
+
+            # 1. RGB base (bands 4-3-2)
+            try:
+                rgb_orig = np_img_orig[[3, 2, 1], :, :]
+                rgb_orig = np.transpose(rgb_orig, (1, 2, 0))
+                rgb_orig_vis = (rgb_orig - rgb_orig.min()) / (rgb_orig.max() - rgb_orig.min() + 1e-8)
+            except Exception:
+                rgb_orig_vis = None
+
+            # 2. Selected band (grayscale)
+            band_idx = g['band_id'] - 1
+            band_img = np_img_orig[band_idx, :, :]
+            band_img_norm = (band_img - band_img.min()) / (band_img.max() - band_img.min() + 1e-8)
+
+            # 3. Grad-CAM heatmap
+            gradcam_img = g['image']
+
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                if rgb_orig_vis is not None:
+                    st.image(rgb_orig_vis, caption="Original RGB (bands 4-3-2)", use_container_width=True)
+                else:
+                    st.write("Unable to display original RGB")
+
+            with col2:
+                # Use clamp and gray colormap
+                st.image(band_img_norm, caption=f"Single-band grayscale (band {g['band_id']})", 
+                        use_container_width=True, channels="GRAY")
+
+            with col3:
+                st.image(
+                    gradcam_img,
+                    caption=f"Grad-CAM class {g['class_id']} ({class_names[g['class_id']]}), band {g['band_id']}",
+                    use_container_width=True
+                )
+
+
+
 
 
 except Exception as e:
