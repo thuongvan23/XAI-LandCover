@@ -1,6 +1,4 @@
 # XAI-LandCover
 
-capstone thuongvth
-
-
+capstone thuongvth a
 
